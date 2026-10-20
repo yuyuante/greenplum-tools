@@ -4,6 +4,13 @@
 same length, starting on the same weekday, in which every table has rows, and shifts
 it onto the requested dates.
 
+Supported input: existing Greenplum *_flx tables with a detectable date key and
+date columns in the formats described in README.md. Product IDs named after the
+table prefix (_prod_id, _prod_id1, _prod_id2) embed YYMMDD in characters 6-11;
+their source century is resolved against the row's source date key. An explicit
+--source-start selects a same-weekday source window. Unsupported or ambiguous
+product date centuries stop the import.
+
 Examples:
   python flx_testdata.py plan --start 2026-06-16 --end 2026-07-19 --sp db_owner.fun_proc_xxx
   python flx_testdata.py apply --start 2026-06-16 --end 2026-07-19 --sp db_owner.fun_proc_xxx
@@ -236,6 +243,111 @@ def shift_expr(column, days):
                        "THEN to_char({} + interval '{} days', {}) ELSE {} END").format(
             parsed, field, parsed, sql.SQL(str(days)), sql.Literal(mask), field)
     return field
+
+
+def product_columns(table, columns):
+    stem = table[1][:-4]
+    names = {stem + "_prod_id", stem + "_prod_id1", stem + "_prod_id2"}
+    return [c for c in columns if c[0].lower() in names]
+
+
+def source_year_expr(key):
+    field = sql.Identifier(key[0])
+    if key[1] == "typed":
+        return sql.SQL("extract(year from {})::int").format(field)
+    return sql.SQL("substr({}, 1, 4)::int").format(field)
+
+
+def shift_product_expr(column, key, days):
+    field = sql.Identifier(column[0])
+    year = source_year_expr(key)
+    yy = sql.SQL("substr({}, 6, 2)::int").format(field)
+    candidate = sql.SQL("((({}) / 100) * 100 + ({}))").format(year, yy)
+    nearest = sql.SQL("({} + CASE WHEN {} - {} > 50 THEN -100 "
+                      "WHEN {} - {} > 50 THEN 100 ELSE 0 END)").format(
+                          candidate, candidate, year, year, candidate)
+    full_date = sql.SQL("lpad(({})::text, 4, '0') || substr({}, 8, 4)").format(nearest, field)
+    parsed = safe_date(full_date, "compact")
+    # The outer CASE guards the YY cast. An invalid or blank source ID remains unchanged.
+    return sql.SQL("CASE WHEN substr({}, 6, 6) ~ '^[0-9]{{6}}$' THEN "
+                   "CASE WHEN {} IS NOT NULL THEN overlay({} placing "
+                   "to_char({} + interval '{} days', 'YYMMDD') from 6 for 6) "
+                   "ELSE {} END ELSE {} END").format(
+                       field, parsed, field, parsed, sql.SQL(str(days)), field, field)
+
+
+def shifted_column_expr(column, table, key, days):
+    if column in product_columns(table, [column]):
+        return shift_product_expr(column, key, days)
+    return shift_expr(column, days)
+
+
+def product_id_expected(value, reference_date, days):
+    if value is None or not value.strip():
+        return value, "blank"
+    token = value[5:11]
+    if not re.fullmatch(r"[0-9]{6}", token):
+        return value, "invalid"
+    yy = int(token[:2])
+    year = reference_date.year
+    candidate = year // 100 * 100 + yy
+    if candidate - year > 50:
+        candidate -= 100
+    elif year - candidate > 50:
+        candidate += 100
+    month, day = int(token[2:4]), int(token[4:6])
+
+    def valid_for(full_year):
+        # Gregorian validity repeats every 400 years, including leap days.
+        try:
+            dt.date(2000 + full_year % 400, month, day)
+        except ValueError:
+            return False
+        return True
+
+    if abs(candidate - year) == 50:
+        other = candidate + (100 if candidate < year else -100)
+        if valid_for(candidate) or valid_for(other):
+            raise ValueError("ambiguous product ID century: " + repr(value))
+        return value, "invalid"
+    if not valid_for(candidate):
+        return value, "invalid"
+    if not 1 <= candidate <= 9999:
+        raise ValueError("product ID year outside supported range: " + repr(value))
+    try:
+        source_date = dt.date(candidate, int(token[2:4]), int(token[4:6]))
+    except ValueError:
+        return value, "invalid"
+    try:
+        shifted = source_date + dt.timedelta(days=days)
+    except OverflowError as exc:
+        raise ValueError("shifted product ID date outside supported range: " + repr(value)) from exc
+    return value[:5] + shifted.strftime("%y%m%d") + value[11:], "shifted"
+
+
+def scan_product_ids(conn, table, columns, key, start, end, days):
+    products = product_columns(table, columns)
+    if not products:
+        return {}
+    predicate, params = window_predicate(key, start, end)
+    query = sql.SQL("SELECT {}, {} FROM {} WHERE {}").format(
+        sql.Identifier(key[0]), sql.SQL(", ").join(sql.Identifier(c[0]) for c in products),
+        qtable(table), predicate)
+    stats = {c[0]: {"shifted": 0, "blank": 0, "invalid": 0} for c in products}
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        for row in cur:
+            reference = row[0]
+            if key[1] == "compact":
+                reference = dt.datetime.strptime(reference, "%Y%m%d").date()
+            elif key[1] == "iso":
+                reference = dt.date.fromisoformat(reference)
+            elif isinstance(reference, dt.datetime):
+                reference = reference.date()
+            for column, value in zip(products, row[1:]):
+                _, status = product_id_expected(value, reference, days)
+                stats[column[0]][status] += 1
+    return stats
 
 
 def save_manifest(path, data):
@@ -473,7 +585,16 @@ def plan(src, dst, args):
     empty = [".".join(t) for t, d in dates.items() if not d]
     if empty:
         raise RuntimeError("來源庫沒有資料：" + ", ".join(empty))
-    window = find_window(dates, args.start, args.end)
+    if getattr(args, "source_start", None):
+        source_start = args.source_start
+        source_end = source_start + (args.end - args.start)
+        if source_start.weekday() != args.start.weekday():
+            raise ValueError("source and destination windows must start on the same weekday")
+        if not all(_has_date(d, source_start, source_end) for d in dates.values()):
+            raise ValueError("selected source window has an empty table")
+        window = source_start, source_end
+    else:
+        window = find_window(dates, args.start, args.end)
     if not window:
         raise RuntimeError("找不到所有資料表皆有資料的來源區段；各表來源日期範圍：\n  " + "\n  ".join(
             "{}：{} ～ {}".format(".".join(t), d[0], d[-1]) for t, d in sorted(dates.items())))
@@ -489,12 +610,17 @@ def plan(src, dst, args):
     for table, (key, cols) in sorted(specs.items()):
         source_count = count(src, table, key, source_start, source_end)
         target_count = count(dst, table, key, args.start, args.end)
+        product_stats = scan_product_ids(src, table, cols, key, source_start, source_end, days)
         selected.append({"table": ".".join(table), "key": list(key),
                          "source_count": source_count, "target_count": target_count,
                          "source_days": _count_dates(dates[table], source_start, source_end),
-                         "via": tables[table], "columns": cols})
+                         "via": tables[table], "product_id_stats": product_stats, "columns": cols})
     window = {"source_start": source_start, "source_end": source_end, "days": days}
     print_summary(args, selected, skipped, window)
+    for entry in selected:
+        for column, counts in entry["product_id_stats"].items():
+            print("PRODUCT_ID {}.{} shifted={} blank={} invalid={}".format(
+                entry["table"], column, counts["shifted"], counts["blank"], counts["invalid"]), flush=True)
     return selected, skipped, window
 
 
@@ -554,7 +680,7 @@ def apply(src, dst, args, selected, skipped, window):
         with tempfile.TemporaryFile(mode="w+b") as spool:
             predicate, params = window_predicate(key, window["source_start"], window["source_end"])
             select_sql = sql.SQL("COPY (SELECT {} FROM {} WHERE {}) TO STDOUT WITH CSV").format(
-                sql.SQL(", ").join(shift_expr(c, window["days"]) for c in columns), qtable(table),
+                sql.SQL(", ").join(shifted_column_expr(c, table, key, window["days"]) for c in columns), qtable(table),
                 sql.SQL(src.cursor().mogrify(predicate.as_string(src), params).decode(src.encoding)))
             if entry["source_count"]:
                 with src.cursor() as cur:
@@ -736,6 +862,8 @@ def verify(dst, path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("plan", "apply", "seal", "verify", "restore"))
+    parser.add_argument("--source-start", type=dt.date.fromisoformat,
+                        help="Use this source window start instead of selecting the latest matching window")
     parser.add_argument("--start", type=dt.date.fromisoformat, help="欲測試的資料起日")
     parser.add_argument("--end", type=dt.date.fromisoformat, help="欲測試的資料迄日")
     parser.add_argument("--source", default="GPstage")
