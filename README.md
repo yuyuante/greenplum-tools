@@ -8,3 +8,4 @@ Greenplum 資料庫相關工具集，每項工具各自放在獨立子目錄，�
 |--------|------|
 | [`distribution-key-detector`](distribution-key-detector/) | 偵測 Greenplum 資料表最佳分佈鍵（Distribution Key）的函式 `public.gp_detect_distribution_key` |
 | [`flx-testdata`](flx-testdata/) | 將來源 Greenplum 的 `_flx` 表資料平移日期後匯入測試環境，並可依執行紀錄還原 |
+| [`object-dependency-finder`](object-dependency-finder/) | 資料庫物件相依關係查找函式；收錄從 GP178 匯出的完整 SQL 與使用說明 |
