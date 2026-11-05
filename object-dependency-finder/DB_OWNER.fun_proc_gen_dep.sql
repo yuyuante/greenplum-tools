@@ -89,7 +89,7 @@ BEGIN
 
     /* 2. 建立資料庫物件清單 */ --@@20250807 因新增v_flow_direction調整邏輯
     --資料庫物件表(table/view/matview/function/trigger)
-    DROP TABLE IF EXISTS tmp_object_list;
+    DROP TABLE IF EXISTS pg_temp.tmp_object_list;
     CREATE TEMP TABLE tmp_object_list (
         object_type   varchar(2)    --物件類型
         ,schema_name   varchar(100)  --schema名稱
@@ -162,7 +162,7 @@ BEGIN
 
     /* 4. 建立temp表 */
     --相依關係表(loop迴圈使用)
-    DROP TABLE IF EXISTS tmp_dep_loop;
+    DROP TABLE IF EXISTS pg_temp.tmp_dep_loop;
     CREATE TEMP TABLE tmp_dep_loop (
         object_type         char(3)             not null       --被依賴物件類型
         ,schema_name            varchar(100)        not null       --被依賴物件schema名稱
@@ -176,7 +176,7 @@ BEGIN
     ) distributed by(schema_name, object_name);
 
     --相依關係結果表
-    DROP TABLE IF EXISTS tmp_dep_result;
+    DROP TABLE IF EXISTS pg_temp.tmp_dep_result;
     CREATE TEMP TABLE tmp_dep_result (
         ser_no              integer             not null       --排序序號
         ,dep_object_type     char(3)             not null       --依賴物件類型
@@ -192,7 +192,7 @@ BEGIN
     ) distributed by(dep_schema_name, dep_object_name);
 
     --功能細節對應表 --@@20250611 新增暫存表
-    DROP TABLE IF EXISTS tmp_dep_func_detail;
+    DROP TABLE IF EXISTS pg_temp.tmp_dep_func_detail;
     CREATE TEMP TABLE tmp_dep_func_detail (
         ser_no              integer             not null       --排序序號
         ,dep_object_type     char(3)             not null       --依賴物件類型
