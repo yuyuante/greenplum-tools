@@ -59,7 +59,9 @@ def connect(alias):
         raise ValueError("連線設定缺少必要欄位：" + str(env_file))
     return psycopg2.connect(host=values["PGHOST"], port=values["PGPORT"],
                             dbname=values["PGDATABASE"], user=values["PGUSER"],
-                            password=values["PGPASSWORD"], connect_timeout=15)
+                            password=values["PGPASSWORD"], connect_timeout=15,
+                            # TCP keepalive：伺服器端連線消失(半開連線)時約 2 分鐘內報錯，避免長時間查詢無限期等待
+                            keepalives=1, keepalives_idle=60, keepalives_interval=10, keepalives_count=5)
 
 
 def catalog(conn):
