@@ -1,6 +1,6 @@
 # `_FLX` 測試資料製作與還原
 
-執行環境：在本目錄執行 `python flx_testdata.py`，需安裝 `psycopg2`。資料庫連線別名取自 `C:\Users\peteryu\code\env\<別名>.txt`；密碼不寫入執行紀錄。
+執行環境：在本目錄執行 `python flx_testdata.py`，需安裝 `psycopg2`。資料庫連線別名取自 `env/<別名>.txt`；密碼不寫入執行紀錄。
 
 ## 製作方式
 

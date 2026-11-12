@@ -18,8 +18,8 @@ declare
     current_dep_level     integer       default 0;
     r                     record                 ;
     ----------debug parameter----------
-    v_debug_date          text;   -- OMNIWARESOFT: the date of execution
-    v_debug_start_time    text;   -- OMNIWARESOFT: the time of the execution(procedure)
+    v_debug_date          text;   -- the date of execution
+    v_debug_start_time    text;   -- the time of the execution(procedure)
     v_debug_func_schema   text;
     v_debug_func_name     text;
     v_debug_msg_id        text;
