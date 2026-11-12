@@ -1,0 +1,157 @@
+name: CI Regression Tests
+
+on:
+  push:
+    branches: [ main, feat/** ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Regression & Database TestSuite
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:9.4
+        env:
+          POSTGRES_DB: gpdb_test
+          POSTGRES_USER: gpadmin
+          POSTGRES_PASSWORD: password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Run Static Analysis & 0-PII Validation
+        run: |
+          python cold-partition-detector/test_ci.py
+
+      - name: Set up Test Database & Mock Environment
+        env:
+          PGPASSWORD: password
+        run: |
+          psql -h localhost -U gpadmin -d gpdb_test -v ON_ERROR_STOP=1 << 'EOF'
+          -- 建立目標 Schema
+          CREATE SCHEMA IF NOT EXISTS db_owner;
+
+          -- 建立測試用母表與分區子表
+          CREATE TABLE db_owner.test_parent_tbl (id int);
+          CREATE TABLE db_owner.test_part_tbl_1 (id int);
+
+          -- 建立 Greenplum 模擬環境 (模擬 2 個 Segments 之非空 gp_dist_random)
+          CREATE OR REPLACE FUNCTION gp_dist_random(tablename text)
+          RETURNS TABLE (
+              schemaname name,
+              relname name,
+              seq_scan bigint,
+              idx_scan bigint,
+              n_live_tup bigint,
+              last_analyze timestamptz,
+              last_vacuum timestamptz,
+              oid oid,
+              relnamespace oid,
+              relkind "char"
+          ) AS $$
+          #variable_conflict use_column
+          DECLARE
+              v_nsp_oid oid;
+          BEGIN
+              SELECT n.oid INTO v_nsp_oid FROM pg_namespace n WHERE n.nspname = 'db_owner';
+
+              IF tablename = 'pg_stat_user_tables' THEN
+                  -- 模擬 Segment 0 與 Segment 1 的讀取計數（合計 2 + 3 = 5 次）
+                  RETURN QUERY SELECT 'db_owner'::name, 'test_part_tbl_1'::name, 1::bigint, 1::bigint, 100::bigint, now(), now(), 0::oid, 0::oid, 'r'::"char";
+                  RETURN QUERY SELECT 'db_owner'::name, 'test_part_tbl_1'::name, 2::bigint, 1::bigint, 100::bigint, now(), now(), 0::oid, 0::oid, 'r'::"char";
+              ELSIF tablename = 'pg_class' THEN
+                  -- 模擬 Segment 0 與 Segment 1 的實體容量對應
+                  RETURN QUERY SELECT 'db_owner'::name, 'test_part_tbl_1'::name, 0::bigint, 0::bigint, 0::bigint, now(), now(), 'db_owner.test_part_tbl_1'::regclass::oid, v_nsp_oid, 'r'::"char";
+                  RETURN QUERY SELECT 'db_owner'::name, 'test_part_tbl_1'::name, 0::bigint, 0::bigint, 0::bigint, now(), now(), 'db_owner.test_part_tbl_1'::regclass::oid, v_nsp_oid, 'r'::"char";
+              END IF;
+          END;
+          $$ LANGUAGE plpgsql;
+
+          -- 建立 Greenplum 非空 pg_partitions 分區字典
+          CREATE VIEW pg_partitions AS
+          SELECT
+              'db_owner'::name AS schemaname,
+              'test_parent_tbl'::name AS tablename,
+              'test_part_tbl_1'::name AS partitiontablename,
+              'p1'::text AS partitionname,
+              'START (1) END (2)'::text AS partitionboundary;
+
+          -- 建立正式版所需之除錯日誌與參數結構
+          CREATE TABLE db_owner.SVEL_PARAM (
+              param_event_id text,
+              param_name text,
+              param_value text
+          );
+
+          CREATE TABLE db_owner.debug_log_s (
+              id serial,
+              log_time timestamptz,
+              log_msg text
+          );
+
+          CREATE TABLE db_owner.debug_log_f (
+              id serial,
+              log_time timestamptz,
+              log_msg text
+          );
+
+          CREATE OR REPLACE FUNCTION db_owner.func_init_dateandtime_out()
+          RETURNS TABLE (v_date text, v_time text) AS $$
+          BEGIN
+              RETURN QUERY SELECT CURRENT_DATE::text, CURRENT_TIME::text;
+          END;
+          $$ LANGUAGE plpgsql;
+
+          CREATE OR REPLACE FUNCTION db_owner.func_gen_debug_me(
+              p_me text, p_date text, p_time text, p_schema text, p_func text, p_step text, p_desc text
+          ) RETURNS text AS $$
+          BEGIN
+              RETURN 'DBG';
+          END;
+          $$ LANGUAGE plpgsql;
+
+          CREATE OR REPLACE FUNCTION db_owner.func_fname_sname_out(p_in text)
+          RETURNS TABLE (v_schema text, v_name text) AS $$
+          BEGIN
+              RETURN QUERY SELECT 'db_owner'::text, 'fun_proc_chk_cold_partitions'::text;
+          END;
+          $$ LANGUAGE plpgsql;
+
+          CREATE OR REPLACE FUNCTION db_owner.func_py_insert_debug(p_msg text)
+          RETURNS text AS $$
+          BEGIN
+              RETURN 'OK';
+          END;
+          $$ LANGUAGE plpgsql;
+          EOF
+
+      - name: Deploy Stored Functions
+        env:
+          PGPASSWORD: password
+        run: |
+          psql -h localhost -U gpadmin -d gpdb_test -v ON_ERROR_STOP=1 -f cold-partition-detector/db_owner.fun_proc_chk_cold_partitions.sql
+          psql -h localhost -U gpadmin -d gpdb_test -v ON_ERROR_STOP=1 -f cold-partition-detector/db_owner.fun_get_cold_partitions.sql
+
+      - name: Run SQL TestSuite in Database Engine
+        env:
+          PGPASSWORD: password
+        run: |
+          psql -h localhost -U gpadmin -d gpdb_test -v ON_ERROR_STOP=1 -f cold-partition-detector/test_cold_partition_detector.sql
